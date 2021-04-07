@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import Adam
 from utils import soft_update, hard_update
-from model import GaussianPolicy, QNetwork, DeterministicPolicy
+from model import GaussianPolicy, QNetwork, DeterministicPolicy, SafeQNetwork
 
 
 class SAC(object):
@@ -21,9 +21,14 @@ class SAC(object):
 
         self.critic = QNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(device=self.device)
         self.critic_optim = Adam(self.critic.parameters(), lr=args.lr)
-
         self.critic_target = QNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
+
+        self.safe_critic = SafeQNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
+        self.safe_critic_optim = Adam(self.critic.parameters(), lr=args.lr)
+        self.safe_critic_target = SafeQNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
+
         hard_update(self.critic_target, self.critic)
+        hard_update(self.safe_critic_target, self.safe_critic)
 
         if self.policy_type == "Gaussian":
             # Target Entropy = −dim(A) (e.g. , -6 for HalfCheetah-v2) as given in the paper
@@ -48,6 +53,48 @@ class SAC(object):
         else:
             _, _, action = self.policy.sample(state)
         return action.detach().cpu().numpy()[0]
+
+    def select_safe_action(self, state):
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        best_action, _, _ = self.policy.sample(state)
+        best_safe_critic_value = self.safe_critic(state, best_action)
+        # eq (3) in https://arxiv.org/pdf/2010.14603.pdf
+        for _ in range(100):
+            action, _, _ = self.policy.sample(state)
+            safe_critic_value = self.safe_critic(state, action)
+            if safe_critic_value <= self.epi_safe:
+                best_action = action
+                break
+            else:
+                if safe_critic_value < best_safe_critic_value:
+                    best_action = action
+                    best_safe_critic_value = safe_critic_value
+        return best_action
+
+    def update_safe_critic(self, memory, batch_size, updates):
+        # Sample a batch from memory
+        state_batch, action_batch, reward_batch, next_state_batch, mask_batch = memory.sample(batch_size=batch_size)
+
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
+
+        # TODO: remember to include mask
+        mask_batch = torch.FloatTensor(mask_batch).to(self.device).unsqueeze(1)
+
+        with torch.no_grad():
+            next_state_action, _ , _ = self.policy.sample(next_state_batch)
+            safe_q_next_target = self.safe_critic_target(next_state_batch, next_state_action)
+            next_safe_q_value = (mask_batch + (1 - mask_batch)) * self.gamma * safe_q_next_target
+        safe_qf = self.safe_critic(state_batch, action_batch)
+        safe_qf_loss = F.mse_loss(safe_qf, next_safe_q_value)
+
+        self.safe_critic_optim.zero_grad()
+        safe_qf_loss.backward()
+        self.safe_critic_optim.step()
+
+        return safe_qf_loss.item()
 
     def update_parameters(self, memory, batch_size, updates):
         # Sample a batch from memory
@@ -104,7 +151,7 @@ class SAC(object):
         return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(), alpha_tlogs.item()
 
     # Save model parameters
-    def save_model(self, env_name, suffix="", actor_path=None, critic_path=None):
+    def save_model(self, env_name, suffix="", actor_path=None, critic_path=None, safe_critic_path=None):
         if not os.path.exists('models/'):
             os.makedirs('models/')
 
@@ -112,15 +159,21 @@ class SAC(object):
             actor_path = "models/sac_actor_{}_{}".format(env_name, suffix)
         if critic_path is None:
             critic_path = "models/sac_critic_{}_{}".format(env_name, suffix)
-        print('Saving models to {} and {}'.format(actor_path, critic_path))
+        if safe_critic_path is None:
+            safe_critic_path = "models/sqrl_critic_{}_{}".format(env_name, suffix)
+
+        print('Saving models to {}, {} and {}'.format(actor_path, critic_path, safe_critic_path))
         torch.save(self.policy.state_dict(), actor_path)
         torch.save(self.critic.state_dict(), critic_path)
+        torch.save(self.safe_critic.state_dict(), safe_critic_path)
 
     # Load model parameters
-    def load_model(self, actor_path, critic_path):
+    def load_model(self, actor_path, critic_path, safe_critic_path):
         print('Loading models from {} and {}'.format(actor_path, critic_path))
         if actor_path is not None:
             self.policy.load_state_dict(torch.load(actor_path))
         if critic_path is not None:
             self.critic.load_state_dict(torch.load(critic_path))
+        if safe_critic_path is not None:
+            self.safe_critic.load_state_dict(torch.load(self_critic_path))
 

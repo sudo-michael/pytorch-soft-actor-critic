@@ -44,6 +44,9 @@ parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
                     help='size of replay buffer (default: 10000000)')
 parser.add_argument('--cuda', action="store_true",
                     help='run on CUDA (default: False)')
+parser.add_argument('--safe_epsi', type=float, default=0.20, metavar='G',
+                    help='safe epsilon (default: 0.20)')
+
 args = parser.parse_args()
 
 # Environment
@@ -64,6 +67,7 @@ writer = SummaryWriter('runs/{}_SAC_{}_{}_{}'.format(datetime.datetime.now().str
 
 # Memory
 memory = ReplayMemory(args.replay_size, args.seed)
+safe_memory = ReplayMemory(args.replay_size, args.seed)
 
 # Training Loop
 total_numsteps = 0
